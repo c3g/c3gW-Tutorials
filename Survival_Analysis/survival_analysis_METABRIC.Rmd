@@ -1,0 +1,597 @@
+---
+title: "Survival analysis tutorial: gene expression and patient outcome in breast cancer"
+subtitle: "A first introduction using the METABRIC dataset"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+date: "`r Sys.Date()`"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. What is survival analysis?
+
+Survival analysis answers one question: **do patients in one group live
+longer than patients in another group?**
+
+In this tutorial we divide breast cancer patients into two groups, based
+on how much of one gene their tumour expresses:
+
+- **High** group: expression above the middle value
+- **Low** group: expression below the middle value
+
+Then we compare how long the patients in each group survive.
+
+## Two things we need for every patient
+
+Survival analysis needs two pieces of information about each patient:
+
+1.  **Time** : how many months the patient was followed by the doctors.
+2.  **Event** : did the thing we are measuring happen during that time?
+    We write this as a number: `1` means yes, `0` means no.
+
+## Censoring: an important idea
+
+Some patients were still alive when the study ended. We do not know how
+long they lived after that. We only know they were alive up to a certain
+date.
+
+These patients are called **censored**. We write `event = 0` for them.
+
+We do not remove censored patients. Their information is still useful:
+they tell us the patient survived at least until that time. Survival
+analysis is designed to use this partial information correctly.
+
+## The Kaplan-Meier curve
+
+The **Kaplan-Meier curve** (also called a KM curve) is a picture of
+survival over time.
+
+- The vertical axis shows the probability of being alive, from 1.0
+  (100%) down to 0.
+- The horizontal axis shows time, in months.
+- The line starts at 1.0, because at the beginning every patient is
+  alive.
+- Every time a patient dies, the line steps down a little.
+- When two groups are compared, we draw one line per group.
+
+**If one line stays above the other line, that group has better
+survival.**
+
+## Two survival endpoints in this tutorial
+
+We will look at two different definitions of "the event":
+
+- **Overall survival (OS)** : the event is **death from any cause**. It
+  does not matter what the patient died of.
+- **Relapse-free survival (RFS)** : the event is **the cancer coming
+  back** (also called relapse or recurrence).
+
+------------------------------------------------------------------------
+
+# 2. Install the software packages
+
+This step installs the R packages we need. A package is a collection of
+extra functions.
+
+Some packages come from **CRAN** (the general R repository) and some
+come from **Bioconductor** (a repository for biology packages).
+
+You only need to run this once. If a package is already installed, it
+will be skipped.
+
+```{r install-packages}
+# Packages from CRAN
+cran_packages <- c("BiocManager", "survival", "survminer", "knitr")
+
+for (p in cran_packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+# Packages from Bioconductor (these need BiocManager, installed above)
+bioc_packages <- c("cBioPortalData", "MultiAssayExperiment")
+
+for (p in bioc_packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    BiocManager::install(p, ask = FALSE, update = FALSE)
+  }
+}
+```
+
+## Check that everything installed correctly
+
+This step confirms that every package is really available. If any
+package shows `FALSE`, the code will stop with an error message telling
+you which one failed.
+
+```{r check-packages}
+all_packages <- c(cran_packages, bioc_packages)
+
+installed <- vapply(all_packages, requireNamespace, logical(1), quietly = TRUE)
+
+knitr::kable(data.frame(Package = all_packages, Installed = installed),
+             caption = "Package installation check")
+
+if (!all(installed)) {
+  stop("These packages did not install: ",
+       paste(all_packages[!installed], collapse = ", "))
+}
+```
+
+> **Note on package names.** In this tutorial every function is written
+> with the package name in front of it, like `survival::coxph()`. The
+> two colons `::` mean "use the function `coxph` from the package
+> `survival`". This makes the code clearer, because you can always see
+> which package each function comes from.
+
+------------------------------------------------------------------------
+
+# 3. Download the METABRIC dataset
+
+METABRIC is a study of about 2,000 breast cancer patients. For each
+patient we have:
+
+- the expression level of every gene in the tumour
+- clinical information, including survival time and whether the patient
+  died
+
+The code below downloads the dataset from cBioPortal, a public website
+that stores cancer genomics data.
+
+**This download is large (a few hundred megabytes) and can take several
+minutes.** It only needs to happen once. After the download, we save the
+data to a file called `metabric_data.rds` on your computer. The next
+time you run this document, the code loads that file instead of
+downloading again.
+
+```{r download-metabric}
+data_file <- "metabric_data.rds"
+
+if (file.exists(data_file)) {
+  metabric <- readRDS(data_file)
+} else {
+  metabric <- cBioPortalData::cBioDataPack("brca_metabric")
+  saveRDS(metabric, data_file)
+}
+```
+
+## Take the two tables we need
+
+The downloaded object contains many different types of data. We only
+need two tables.
+
+- **Expression table**: how much each gene is expressed, in each
+  patient. Rows are genes, columns are patients.
+- **Clinical table**: information about each patient, including
+  survival.
+
+```{r extract-tables}
+# Gene expression (rows = genes, columns = patients)
+expression <- MultiAssayExperiment::assay(metabric[["mrna_illumina_microarray"]])
+
+# Clinical information (rows = patients)
+clinical <- as.data.frame(MultiAssayExperiment::colData(metabric))
+
+# How big are these tables?
+cat("Expression table:", nrow(expression), "genes x", ncol(expression), "patients\n")
+cat("Clinical table:  ", nrow(clinical), "patients x", ncol(clinical), "columns\n")
+```
+
+------------------------------------------------------------------------
+
+# 4. Choose a gene
+
+We will study the gene **MKI67**.
+
+MKI67 makes a protein called **Ki-67**. Ki-67 is only present in cells
+that are dividing. Therefore, a tumour with high MKI67 expression is a
+tumour where many cells are dividing quickly.
+
+Fast-dividing tumours usually grow faster and spread earlier. So we
+expect:
+
+> **High MKI67 expression should be connected to worse survival.**
+
+Ki-67 is not only used in research. Doctors already measure it in the
+clinic to help describe how aggressive a breast tumour is. This makes it
+a good and realistic example for a first analysis.
+
+```{r choose-gene}
+gene_of_interest <- "MKI67"
+
+# Check the gene exists in the expression table
+if (!gene_of_interest %in% rownames(expression)) {
+  stop("This gene is not in the dataset: ", gene_of_interest)
+}
+```
+
+> **To study a different gene later**, change only the name in
+> `gene_of_interest` above, then run the document again. Everything else
+> works automatically.
+
+------------------------------------------------------------------------
+
+# 5. Build the table for the analysis
+
+Now we build one simple table. Each row is one patient. The columns are:
+
+| Column | Meaning |
+|------------------------------------|------------------------------------|
+| `patient_id` | The identity code of the patient |
+| `expression` | How much the gene is expressed in this patient's tumour |
+| `group` | `High` or `Low`, decided by the middle value (median) |
+| `os_months` | Overall survival: months of follow-up |
+| `os_event` | Overall survival: 1 = died, 0 = still alive (censored) |
+| `rfs_months` | Relapse-free survival: months of follow-up |
+| `rfs_event` | Relapse-free survival: 1 = cancer returned, 0 = did not return (censored) |
+
+## About the High and Low groups
+
+We use the **median** to split the patients. The median is the middle
+value: half the patients are above it and half are below it. This gives
+two groups of equal size.
+
+## About the event columns
+
+In the original data, the status is written as text, for example
+`"1:DECEASED"` or `"0:LIVING"`. Survival analysis needs a number. So we
+convert the text to `1` or `0`.
+
+```{r build-table}
+# Take the expression values of our gene, for every patient
+gene_values <- as.numeric(expression[gene_of_interest, ])
+
+# Start the table
+patients <- data.frame(
+  patient_id = colnames(expression),
+  expression = gene_values
+)
+
+# Add the clinical information for the same patients
+patients <- merge(patients, clinical, by.x = "patient_id", by.y = "row.names")
+
+# Split patients into High and Low, using the median
+median_value <- stats::median(patients$expression, na.rm = TRUE)
+
+patients$group <- factor(
+  ifelse(patients$expression >= median_value, "High", "Low"),
+  levels = c("Low", "High")     # "Low" is the reference group
+)
+
+# Overall survival: time and event
+patients$os_months <- patients$OS_MONTHS
+patients$os_event  <- as.integer(grepl("^1", patients$OS_STATUS))   # 1 = died
+
+# Relapse-free survival: time and event
+patients$rfs_months <- patients$RFS_MONTHS
+patients$rfs_event  <- as.integer(grepl("^1", patients$RFS_STATUS)) # 1 = relapsed
+
+# Look at the result
+knitr::kable(head(patients[, c("patient_id", "expression", "group",
+                               "os_months", "os_event",
+                               "rfs_months", "rfs_event")]),
+             caption = "First six patients in the analysis table")
+```
+
+## How many patients are in each group?
+
+```{r group-sizes}
+knitr::kable(as.data.frame(table(Group = patients$group), responseName = "Patients"),
+             caption = paste("Number of patients in each", gene_of_interest, "group"))
+```
+
+------------------------------------------------------------------------
+
+# 6. Draw the Kaplan-Meier curves
+
+This small function draws one Kaplan-Meier plot. We will use it two
+times: once for overall survival, and once for relapse-free survival.
+
+The subtitle of each plot also shows the **hazard ratio**. This number
+is explained in section 8.
+
+```{r km-function}
+draw_km_plot <- function(time_column, event_column, plot_title) {
+
+  # Keep only patients who have all three values
+  d <- patients[stats::complete.cases(
+         patients[, c(time_column, event_column, "group")]), ]
+
+  # Give the columns simple names
+  d$time  <- d[[time_column]]
+  d$event <- d[[event_column]]
+
+  # Hazard ratio, shown in the subtitle (explained in section 8)
+  cox <- survival::coxph(survival::Surv(time, event) ~ group, data = d)
+  ci  <- summary(cox)$conf.int
+  subtitle_text <- sprintf(
+    "Hazard ratio (High vs Low) = %.2f (95%% CI %.2f to %.2f)  |  %d patients, %d events",
+    ci[1, "exp(coef)"], ci[1, "lower .95"], ci[1, "upper .95"],
+    nrow(d), sum(d$event))
+
+  # Calculate the survival curves for the two groups
+  fit <- survival::survfit(survival::Surv(time, event) ~ group, data = d)
+
+  # Draw the plot
+  survminer::ggsurvplot(
+    fit, data = d,
+    pval = TRUE,                                   # show the log-rank p-value
+    conf.int = TRUE,                               # show the uncertainty band
+    palette = c("#377EB8", "#E41A1C"),             # blue = Low, red = High
+    legend.title = gene_of_interest,
+    legend.labs = c("Low", "High"),
+    xlab = "Time (months)",
+    ylab = "Probability of survival",
+    title = plot_title,
+    subtitle = subtitle_text,
+    break.time.by = 50,
+    risk.table = TRUE,                             # table of patients still followed
+    risk.table.title = "Number of patients still being followed",
+    risk.table.height = 0.28,
+    risk.table.y.text = FALSE,
+    ggtheme = ggplot2::theme_bw(base_size = 13)
+  )
+}
+```
+
+## Overall survival
+
+Here the event is **death from any cause**.
+
+```{r km-overall-survival, fig.width=8, fig.height=7}
+draw_km_plot("os_months", "os_event",
+             paste("Overall survival by", gene_of_interest, "expression"))
+```
+
+## Relapse-free survival
+
+Here the event is **the cancer coming back**.
+
+```{r km-relapse-free-survival, fig.width=8, fig.height=7}
+draw_km_plot("rfs_months", "rfs_event",
+             paste("Relapse-free survival by", gene_of_interest, "expression"))
+```
+
+------------------------------------------------------------------------
+
+# 7. How to read these plots
+
+## The two coloured lines
+
+Each line is one group. **Blue is the Low group. Red is the High
+group.**
+
+The line that stays **higher** on the plot is the group with **better
+survival**.
+
+## The p-value
+
+The number written as `p = ...` is the result of a statistical test
+called the **log-rank test**. It answers this question:
+
+> If the two groups really had the same survival, how likely is it that
+> we would see a difference as large as this one, only by chance?
+
+- A **small** p-value (usually below 0.05) means the difference is
+  unlikely to be caused by chance. We say the difference is
+  *statistically significant*.
+- A **large** p-value means we did not find clear evidence of a
+  difference.
+
+Important: a small p-value tells you the difference is probably real. It
+does **not** tell you the difference is large or medically important.
+
+## The shaded bands
+
+The pale colour around each line shows the **uncertainty**. When the
+band is narrow, the estimate is precise. When the band is wide, we are
+less sure about the exact position of the line.
+
+## The table below the plot
+
+This table shows **how many patients were still being followed** at each
+time point.
+
+This number becomes smaller over time, for two reasons: some patients
+had the event, and some patients reached the end of their follow-up
+(they were censored).
+
+**This table is important.** On the right side of the plot, the number
+of patients is usually very small. The curve in that region is based on
+only a few people, so it is not reliable. Always look at the numbers
+before you believe the end of a curve.
+
+------------------------------------------------------------------------
+
+# 8. Cox regression and the hazard ratio
+
+The Kaplan-Meier curve shows us the *shape* of survival, and the p-value
+tells us whether the two groups are different. But neither of them tells
+us **how big** the difference is.
+
+For that we use **Cox regression** (also called the Cox proportional
+hazards model). Cox regression gives us one number that measures the
+size of the difference: the **hazard ratio**.
+
+## What is a hazard?
+
+The **hazard** is the risk of the event happening at this moment, for
+the patients who have survived until now.
+
+## What is a hazard ratio?
+
+The **hazard ratio (HR)** compares the hazard of one group to the hazard
+of the other group. In this tutorial it compares the High group to the
+Low group.
+
+| Hazard ratio | Meaning |
+|------------------------------------|------------------------------------|
+| **HR = 1** | The two groups have the same risk. No difference. |
+| **HR \> 1** | The High group has **more** risk. High expression is connected to **worse** survival. |
+| **HR \< 1** | The High group has **less** risk. High expression is connected to **better** survival. |
+
+You can read the number directly as a percentage:
+
+- HR = 1.50 means the High group has **50% more** risk.
+- HR = 0.70 means the High group has **30% less** risk.
+
+## The confidence interval
+
+The hazard ratio is an estimate, so it comes with a **95% confidence
+interval (CI)**. The confidence interval is the range of values that are
+compatible with the data.
+
+The important rule:
+
+> **If the confidence interval does not include 1, the result is
+> statistically significant.**
+>
+> If the confidence interval does include 1, we cannot exclude the
+> possibility that there is no difference.
+
+For example, an HR of 1.50 with CI from 1.20 to 1.90 does not include 1,
+so it is significant. An HR of 1.50 with CI from 0.90 to 2.50 does
+include 1, so it is not significant, even though the estimate looks
+large.
+
+## Calculate the hazard ratios
+
+```{r cox-hazard-ratios}
+hazard_ratio_table <- function(time_column, event_column, endpoint_name) {
+
+  d <- patients[stats::complete.cases(
+         patients[, c(time_column, event_column, "group")]), ]
+  d$time  <- d[[time_column]]
+  d$event <- d[[event_column]]
+
+  model <- survival::coxph(survival::Surv(time, event) ~ group, data = d)
+  s     <- summary(model)
+
+  data.frame(
+    Endpoint          = endpoint_name,
+    Comparison        = "High vs Low",
+    Patients          = s$n,
+    Events            = s$nevent,
+    `Hazard ratio`    = round(s$conf.int[1, "exp(coef)"], 2),
+    `CI lower`        = round(s$conf.int[1, "lower .95"], 2),
+    `CI upper`        = round(s$conf.int[1, "upper .95"], 2),
+    `p-value`         = signif(s$coefficients[1, "Pr(>|z|)"], 3),
+    check.names = FALSE, row.names = NULL
+  )
+}
+
+knitr::kable(
+  rbind(hazard_ratio_table("os_months",  "os_event",  "Overall survival"),
+        hazard_ratio_table("rfs_months", "rfs_event", "Relapse-free survival")),
+  caption = paste("Cox regression:", gene_of_interest,
+                  "High vs Low. HR above 1 means worse survival.")
+)
+```
+
+## How to read this table
+
+Look at the three numbers together, in this order:
+
+1.  **Hazard ratio** : how big is the difference, and in which
+    direction?
+2.  **CI lower and CI upper** : does this range include 1? If not, the
+    result is significant.
+3.  **p-value** : this should agree with the confidence interval. A
+    p-value below 0.05 goes together with a confidence interval that
+    does not include 1.
+
+The p-value here comes from the Cox model. It is calculated in a
+slightly different way from the log-rank p-value on the plot, so the two
+numbers can be very slightly different. This is normal. They almost
+always lead to the same conclusion.
+
+------------------------------------------------------------------------
+
+# 9. Median survival time
+
+The **median survival time** is the time at which half of the patients
+in a group have had the event. On the plot, it is the time where the
+curve crosses 0.5 on the vertical axis.
+
+If a group survives well, the curve may never reach 0.5. In that case
+the median cannot be calculated, and the table shows `NA`.
+
+```{r median-survival}
+median_table <- function(time_column, event_column, endpoint_name) {
+  d <- patients[stats::complete.cases(
+         patients[, c(time_column, event_column, "group")]), ]
+  d$time  <- d[[time_column]]
+  d$event <- d[[event_column]]
+
+  fit <- survival::survfit(survival::Surv(time, event) ~ group, data = d)
+  s   <- summary(fit)$table
+
+  data.frame(
+    Endpoint = endpoint_name,
+    Group    = c("Low", "High"),
+    Patients = s[, "records"],
+    Events   = s[, "events"],
+    `Median survival (months)` = round(s[, "median"], 1),
+    check.names = FALSE, row.names = NULL
+  )
+}
+
+knitr::kable(
+  rbind(median_table("os_months",  "os_event",  "Overall survival"),
+        median_table("rfs_months", "rfs_event", "Relapse-free survival")),
+  caption = paste("Median survival time by", gene_of_interest, "group")
+)
+```
+
+------------------------------------------------------------------------
+
+# 10. Summary
+
+In this tutorial you have:
+
+1.  Installed the required R packages.
+2.  Downloaded the METABRIC breast cancer dataset.
+3.  Chosen one gene, MKI67, and divided the patients into a High group
+    and a Low group.
+4.  Drawn Kaplan-Meier curves for two endpoints: overall survival and
+    relapse-free survival.
+5.  Calculated hazard ratios with Cox regression, to measure how big the
+    difference is.
+6.  Read the curves, the p-value, the confidence interval, and the
+    number of patients still being followed.
+
+MKI67 marks dividing cells, so tumours with high MKI67 are growing
+quickly. The results show this clearly: patients with high MKI67
+expression have worse survival, and the hazard ratio is above 1 for both
+endpoints.
+
+## What to try next
+
+- **Change the gene.** Go back to section 4 and put a different gene
+  name in `gene_of_interest`. Then run the document again. Two good
+  genes to try are `ESR1` (the oestrogen receptor, usually connected to
+  *better* survival, so the hazard ratio should be below 1) and `AURKA`
+  (another gene linked to cell division).
+- **Note that not every gene will show a difference.** This is a normal
+  and correct result. Most genes are not connected to survival.
+
+## Two important limits of this analysis
+
+- **This analysis does not adjust for anything else.** Patient age,
+  tumour size and tumour grade also affect survival. Here we compare
+  only High and Low expression, and nothing else. Cox regression can
+  also include these other variables at the same time, which is called a
+  *multivariable* model. That is the natural next step after this
+  tutorial.
+- **A statistical association is not a cause.** These results show that
+  high MKI67 and worse survival happen together. They do not prove that
+  MKI67 *causes* the worse outcome.
