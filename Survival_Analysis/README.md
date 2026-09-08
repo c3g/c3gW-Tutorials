@@ -1,6 +1,6 @@
 # Description
-This tutorial describes ...
+This tutorial provides instruction on how to perform survival analysis, directed at a beginner
 
 # Tags
-Cancer, single-cell...
+Cancer, survival analysis, RNA-seq
 
