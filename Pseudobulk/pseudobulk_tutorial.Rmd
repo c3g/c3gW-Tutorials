@@ -1,0 +1,395 @@
+---
+title: "Pseudobulk tutorial: from single cells to a bulk RNA-seq count table"
+subtitle: "A first introduction using mouse placenta single-cell data (GEO GSE347706)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+date: "`r Sys.Date()`"
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. What is pseudobulk?
+
+A single-cell RNA-seq experiment measures gene expression in **each
+cell**. One experiment can have 100,000 to 500,000 cells or more. This
+is a lot of data. It needs a big computer, and the analysis tools are
+different from the bulk RNA-seq tools that many scientists already know.
+
+**Pseudobulk** is a simple idea that makes single-cell data look like
+bulk RNA-seq data again:
+
+> For each cell type, in each sample, we **add up the raw counts of all
+> the cells**. The result is one column of counts per cell type per
+> sample, just like a bulk RNA-seq sample.
+
+```{r overview-figure, echo=FALSE, out.width="85%", fig.align="center"}
+knitr::include_graphics("pseudobulk_overview.png")
+```
+
+The figure shows the trade-off:
+
+| Single cells | Pseudobulk |
+|------------------------------------|------------------------------------|
+| 100k to 500k+ data points (cells) | Hundreds of data points (cell type x sample) |
+| Needs a big computer (a lot of RAM) | Works on a normal laptop (about 8 GB RAM) |
+| You can still change the clusters | The clusters are **locked in** |
+| Needs special single-cell tools | Works with bulk tools: **edgeR, DESeq2, limma** |
+
+**"Locked in"** means this: the table is made from the cell types you
+have now. If you change the cell types later (for example, you split
+one cluster into two), you must make the table again. This is easy:
+you just run this document again.
+
+## Words we use in this tutorial
+
+| Word | Meaning |
+|------------------------------------|------------------------------------|
+| **Raw counts** | The number of RNA molecules counted for each gene in each cell. Always whole numbers: 0, 1, 2, 3 ... |
+| **Cluster** or **cell type** | A group of similar cells, for example "B cells". |
+| **Sample** or **replicate** | One biological unit: one patient, one mouse, one cell line culture. |
+| **Pseudosample** | One cell type in one sample. This becomes one column in the final table. |
+
+------------------------------------------------------------------------
+
+# 2. Install the software packages
+
+You only need to run this once. If a package is already installed, it
+will be skipped.
+
+- **Seurat**: the most common R package for single-cell data.
+- **edgeR**: a bulk RNA-seq package. We use it at the end, to show that
+  the table is ready for bulk analysis.
+- **openxlsx**: writes Excel files.
+
+```{r install-packages}
+# Packages from CRAN (the general R repository)
+cran_packages <- c("BiocManager", "Seurat", "openxlsx", "knitr")
+
+for (p in cran_packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+}
+
+# Packages from Bioconductor (the repository for biology packages)
+bioc_packages <- c("edgeR")
+
+for (p in bioc_packages) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    BiocManager::install(p, ask = FALSE, update = FALSE)
+  }
+}
+
+# Check that everything is installed
+all_packages <- c(cran_packages, bioc_packages)
+installed <- vapply(all_packages, requireNamespace, logical(1), quietly = TRUE)
+if (!all(installed)) {
+  stop("These packages did not install: ",
+       paste(all_packages[!installed], collapse = ", "))
+}
+```
+
+> **Note on package names.** Every function in this tutorial is written
+> with its package name in front, like `Seurat::AggregateExpression()`.
+> The two colons `::` mean "use this function from this package". This
+> way you can always see where each function comes from.
+
+------------------------------------------------------------------------
+
+# 3. Download the example dataset
+
+We use a public mouse dataset from GEO (accession
+[GSE347706](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE347706)).
+The study asked: **does stress during pregnancy change the placenta?**
+
+- **Stress group**: 3 pregnant mice were stressed for 2 hours every day.
+- **Control group**: 3 pregnant mice were not stressed.
+- The placentas were collected, and about 27,000 single cells were
+  sequenced.
+- Each sample is the placentas from **one mother** (one litter).
+
+The authors uploaded a ready-to-use **Seurat object** (a `.rds` file).
+The download is about **300 MB**. It only happens once. The next time
+you run this document, R loads the file from your computer.
+
+```{r download-data}
+data_file <- "GSE347706_placenta_scRNAseq_processed_seurat.rds"
+data_url  <- paste0("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE347nnn/",
+                    "GSE347706/suppl/", data_file)
+
+if (!file.exists(data_file)) {
+  options(timeout = 3600)                 # allow up to 1 hour for the download
+  download.file(data_url, data_file, mode = "wb")
+}
+
+obj <- readRDS(data_file)
+obj
+```
+
+## What is inside a Seurat object?
+
+For pseudobulk, we only need two parts of the object:
+
+1.  **The raw counts**: a table with genes as rows and cells as columns.
+2.  **The metadata**: a table with one row per cell. It tells us which
+    sample and which cell type each cell belongs to.
+
+```{r look-at-metadata}
+meta <- obj[[]]     # the metadata table (one row per cell)
+
+knitr::kable(head(meta[, c("Sample", "Treatment", "Batch", "cell")]),
+             caption = "The first six cells in the metadata table")
+```
+
+## Check that the counts are really raw counts
+
+This step is important. Pseudobulk must use **raw counts**. Bulk tools
+like edgeR and DESeq2 give wrong results with normalised values.
+
+Many public Seurat objects have a layer called `counts` that does **not**
+contain raw counts. Raw counts are always whole numbers, so we check
+that.
+
+```{r check-raw-counts}
+counts <- SeuratObject::LayerData(obj, assay = "RNA", layer = "counts")
+
+counts[1:5, 1:3]     # a dot "." means zero
+
+# Are all values whole numbers?
+all(counts@x == round(counts@x))
+```
+
+The answer is `TRUE`, so the counts are raw. If you see `FALSE` with
+your own data, stop and find the raw counts first.
+
+------------------------------------------------------------------------
+
+# 4. Step 1: Lock in the clusters
+
+First we choose the metadata column that says which cell type each cell
+is. In this dataset the column is called `cell`. The authors already
+named 13 cell types.
+
+We make a copy of this column with a clean name, `cell_type`. We also
+replace the symbols `Φ` and `/` in the names, because special symbols
+can cause problems in Excel and in file names.
+
+```{r lock-clusters}
+obj$cell_type <- gsub("MΦ/Monos", "Macrophage-Monocyte", obj$cell)
+
+knitr::kable(as.data.frame(table(cell_type = obj$cell_type),
+                           responseName = "Cells"),
+             caption = "Number of cells in each cell type")
+```
+
+> **This is the moment the clusters are locked in.** If you want
+> different cell types (for example, more detailed ones), change this
+> column now, before you go on.
+
+------------------------------------------------------------------------
+
+# 5. Step 2: Choose the replicate column
+
+Next we choose the column that says which **biological replicate** each
+cell comes from. Here it is `Sample`: each sample is one mother.
+
+Why does this matter? Cells from the same mouse are not independent.
+They share the same genes, the same environment and the same lab
+processing. So the real number of replicates is the number of
+**mice**, not the number of cells. If we use cells as replicates, we
+get many false positive results.
+
+```{r choose-replicates}
+knitr::kable(table(obj$Sample, obj$Treatment),
+             caption = "Each sample belongs to one group")
+```
+
+We have **3 Control and 3 Stress** samples. You need **at least 3
+replicates per group** for a valid group comparison. 2 replicates per
+group is the minimum for the statistics to work, but it is not
+recommended. More is better.
+
+------------------------------------------------------------------------
+
+# 6. Step 3: Check the number of cells in each pseudosample
+
+Now we count the cells for each cell type in each sample. Each number
+becomes one column in our final table.
+
+If a pseudosample has only a few cells (for example, fewer than 10), its
+counts are not reliable. You may want to remove it, or merge small cell
+types together.
+
+```{r cells-per-pseudosample}
+cell_table <- table(obj$cell_type, obj$Sample)
+knitr::kable(cell_table, caption = "Number of cells: cell type x sample")
+
+cat("Smallest pseudosample:", min(cell_table), "cells\n")
+```
+
+All pseudosamples have at least 62 cells, so we keep all of them.
+
+------------------------------------------------------------------------
+
+# 7. Step 4: Add up the raw counts
+
+This is the main step. `Seurat::AggregateExpression()` adds up the raw
+counts of all cells with the same cell type **and** the same sample.
+
+```{r aggregate}
+# In Seurat v5, counts can be split into several layers. Join them first.
+obj <- SeuratObject::JoinLayers(obj)
+
+pseudobulk <- Seurat::AggregateExpression(
+  obj,
+  assays   = "RNA",
+  group.by = c("cell_type", "Sample")   # one column per cell type x sample
+)$RNA
+
+dim(pseudobulk)    # genes x pseudosamples
+pseudobulk[c("Actb", "Gapdh", "Malat1"), 1:3]    # three well-known genes
+```
+
+The data shrank from **`r format(ncol(obj), big.mark = ",")` cells**
+to **`r ncol(pseudobulk)` pseudosamples** (13 cell types x 6 samples).
+
+As a check, the total number of counts must be the same before and
+after. We only added the numbers together, we did not change them.
+
+```{r check-sum}
+sum(pseudobulk) == sum(counts)
+```
+
+------------------------------------------------------------------------
+
+# 8. Step 5: Save the results
+
+We save two tables, exactly like a bulk RNA-seq experiment:
+
+1.  **The counts table**: genes as rows, pseudosamples as columns.
+2.  **The sample sheet**: one row per pseudosample, with its cell type,
+    sample, group and number of cells.
+
+## Make the sample sheet
+
+```{r sample-sheet}
+# One row per cell type x sample, with the number of cells
+sample_sheet <- as.data.frame(cell_table, stringsAsFactors = FALSE)
+colnames(sample_sheet) <- c("cell_type", "sample", "n_cells")
+
+# The same names that AggregateExpression() gave to the columns
+sample_sheet$pseudosample <- paste(sample_sheet$cell_type, sample_sheet$sample, sep = "_")
+
+# Add the group (Control or Stress) and the batch of each sample
+sample_info  <- unique(meta[, c("Sample", "Treatment", "Batch")])
+sample_sheet <- merge(sample_sheet, sample_info, by.x = "sample", by.y = "Sample")
+
+# Put the rows in the same order as the columns of the counts table
+sample_sheet <- sample_sheet[match(colnames(pseudobulk), sample_sheet$pseudosample),
+                             c("pseudosample", "cell_type", "sample",
+                               "Treatment", "Batch", "n_cells")]
+rownames(sample_sheet) <- NULL
+
+# Safety check: the two tables must be in the same order
+stopifnot(identical(sample_sheet$pseudosample, colnames(pseudobulk)))
+
+knitr::kable(head(sample_sheet), caption = "First rows of the sample sheet")
+```
+
+## Write the files
+
+This dataset only has gene **symbols** (for example `Sox17`), not
+Ensembl gene IDs. If your own data has both, add both as columns.
+
+```{r save-files}
+dir.create("pseudobulk_output", showWarnings = FALSE)
+
+counts_table <- data.frame(gene = rownames(pseudobulk),
+                           as.matrix(pseudobulk),
+                           check.names = FALSE)
+
+# CSV files (open in any program)
+write.csv(counts_table, "pseudobulk_output/pseudobulk_counts.csv", row.names = FALSE)
+write.csv(sample_sheet, "pseudobulk_output/sample_sheet.csv",      row.names = FALSE)
+
+# One Excel file with two sheets
+openxlsx::write.xlsx(list(counts = counts_table, samples = sample_sheet),
+                     "pseudobulk_output/pseudobulk_tables.xlsx")
+
+list.files("pseudobulk_output")
+```
+
+------------------------------------------------------------------------
+
+# 9. The table is ready for bulk tools
+
+The pseudobulk table is now a normal bulk RNA-seq count table. As an
+example, we compare **Stress vs Control** in one cell type,
+syncytiotrophoblasts, with **edgeR**. These are the standard edgeR
+steps, the same as for any bulk RNA-seq experiment.
+
+```{r edger}
+keep <- sample_sheet$cell_type == "Syncytiotrophoblasts"   # 6 columns: 3 Control, 3 Stress
+
+y <- edgeR::DGEList(pseudobulk[, keep], group = sample_sheet$Treatment[keep])
+y <- edgeR::normLibSizes(y[edgeR::filterByExpr(y), , keep.lib.sizes = FALSE])
+
+design  <- model.matrix(~ Treatment, data = sample_sheet[keep, ])
+results <- edgeR::glmQLFTest(edgeR::glmQLFit(y, design))
+
+top <- edgeR::topTags(results, n = 10)$table
+knitr::kable(signif(top[, c("logFC", "PValue", "FDR")], 3),
+             caption = "Top 10 genes: Stress vs Control, in syncytiotrophoblasts")
+```
+
+## How to read this table
+
+- **logFC**: the log2 fold change. A positive number means the gene is
+  **higher in Stress**. A negative number means it is **lower in
+  Stress**. A logFC of 1 means 2 times higher.
+- **FDR**: the p-value corrected for testing thousands of genes. Genes
+  with **FDR below 0.05** are usually called significant.
+
+In this cell type,
+**`r sum(edgeR::topTags(results, n = Inf)$table$FDR < 0.05)` genes**
+have FDR below 0.05. This is a small number, and it is a normal result:
+with only 3 mice per group, a statistical test can only find strong and
+consistent changes.
+
+------------------------------------------------------------------------
+
+# 10. Summary
+
+In this tutorial you have:
+
+1.  **Locked in the clusters**: chosen the cell type column.
+2.  **Chosen the replicate column**: one sample per mouse.
+3.  **Checked the cells** in each cell type x sample.
+4.  **Added up the raw counts** with `Seurat::AggregateExpression()`.
+5.  **Saved** a counts table and a sample sheet, and analysed them with
+    edgeR.
+
+The data shrank from about 27,000 cells to 78 columns. From here, you
+can use any bulk RNA-seq method you already know.
+
+## Things to remember
+
+- **Always use raw counts.** Check that they are whole numbers.
+- **Replicates are mice or patients, not cells.**
+- **Changing the clusters means making the table again.** Just run this
+  document again after you change the cell type column.
+- **Watch for batch effects.** In this dataset, the samples were
+  processed in two batches (the `Batch` column). With more replicates,
+  you could add batch to the design: `~ Batch + Treatment`.
+
+```{r session-info}
+sessionInfo()
+```
