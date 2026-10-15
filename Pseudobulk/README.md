@@ -5,4 +5,4 @@ This tutorial provides instruction on how to turn single-cell RNA-seq data into 
 RNA-seq, single-cell
 
 # Main_tutorial
-Pseudobulk_tutorial.html
+pseudobulk_tutorial.html
